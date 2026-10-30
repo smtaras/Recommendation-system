@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+implicit==0.7.2
+kagglehub
+ipykernel
+fastapi
+pydantic
+uvicorn[standard]
