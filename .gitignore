@@ -1,2 +1,3 @@
 data/
-artifacts/als_model.npz
+artifacts/*.npz
+__pycache__/

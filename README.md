@@ -7,28 +7,55 @@ Pet project for exploring two recommendation approaches on the Retailrocket e-co
 
 The notebooks contain the data exploration, modelling, and evaluation. The local API serves the personalized ALS model and falls back to popular items for visitors not present in the training data.
 
+## Quick start
+
+The trained model is **not stored in this repository** (it is too large for GitHub). Instead, `train.py` downloads the dataset, trains the model, and can start the API in one command.
+
+```bash
+git clone https://github.com/smtaras/Recommendation-system.git
+cd Recommendation-system
+
+python -m venv .venv
+# Linux / macOS:  source .venv/bin/activate
+# Windows:        .venv\Scripts\activate
+
+python -m pip install -r requirements.txt
+python train.py --serve
+```
+
+Then open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) and try `POST /recommendations`.
+
+The first run downloads the dataset from Kaggle and trains the model, which takes a few minutes. Later runs detect the existing artifacts, skip training, and start the API right away.
+
+If Kaggle asks for credentials, see [Dataset](#dataset) below.
+
 ## Project structure
 
 ```text
 .
 ├── 01_related_item_recommendations.ipynb
 ├── 02_personalized_recommendations.ipynb
-├── recommender.py
-├── app.py
+├── train.py                 # downloads data, trains ALS, writes artifacts, optionally starts the API
+├── recommender.py           # Recommender class used by the API
+├── app.py                   # FastAPI application
 ├── requirements.txt
-├── data/                    # local Kaggle CSVs; not committed
-└── artifacts/               # trained model, sparse matrix, and metadata
+├── .gitignore
+├── data/                    # Kaggle CSVs; created by train.py, not committed
+└── artifacts/               # trained model, sparse matrix, and metadata; created by train.py, not committed
 ```
 
 ## Dataset
 
-The notebooks use the [Retailrocket eCommerce dataset on Kaggle](https://www.kaggle.com/retailrocket/ecommerce-dataset). The local `data/` directory should contain:
+The project uses the [Retailrocket eCommerce dataset on Kaggle](https://www.kaggle.com/retailrocket/ecommerce-dataset).
 
-- `events.csv`
-- `item_properties_part1.csv` and `item_properties_part2.csv` for the category-based steps in Notebook 01;
-- `category_tree.csv` is included in the Kaggle download, but the current notebooks do not read it.
+**For the API and `train.py`**, only `events.csv` is needed. If `data/events.csv` is missing, `train.py` downloads the dataset with `kagglehub` and copies `events.csv` into `data/` automatically. If the download fails (for example, Kaggle requires credentials), either:
 
-Both notebooks read `events.csv` from `data/`; Notebook 01 also reads the two item-property files. The first notebook downloads the Kaggle dataset with `kagglehub` and prints the cache path, but does not automatically copy those files into `data/`. Place the required CSVs there before running the notebooks. The API does not need the raw CSVs once the model artifacts exist.
+- create an API token at [kaggle.com/settings](https://www.kaggle.com/settings) and put `kaggle.json` into `~/.kaggle/`, or set the `KAGGLE_USERNAME` and `KAGGLE_KEY` environment variables; or
+- download the dataset manually and place `events.csv` into `data/`.
+
+**For the notebooks:** both notebooks read `events.csv` from `data/`; Notebook 01 also reads `item_properties_part1.csv` and `item_properties_part2.csv`. The first notebook downloads the Kaggle dataset with `kagglehub` and prints the cache path, but does not copy the item-property files into `data/`, so place them there before running Notebook 01. `category_tree.csv` is part of the Kaggle download, but the current notebooks do not read it.
+
+The API does not need the raw CSVs once the model artifacts exist.
 
 The dataset contains event and item identifiers, not a human-readable product catalogue. `item_properties` includes a numeric `categoryid`; `category_tree.csv` describes parent-child relationships between category IDs, but does not provide readable category names. The API therefore returns item IDs. A storefront would need to join those IDs with its own catalogue to display product names, images, or descriptions.
 
@@ -80,6 +107,28 @@ The two validation windows used for the `alpha` comparison were:
 
 These windows have different training histories and target populations, so compare each configuration within a window rather than interpreting the two rows as directly equivalent test populations. `alpha=40` was retained as the balanced choice across the two windows.
 
+## Training script (`train.py`)
+
+`train.py` reproduces the final training configuration of Notebook 02 as a standalone script. It runs these steps:
+
+1. checks that the required Python packages are installed;
+2. downloads `events.csv` into `data/` if it is not already there;
+3. builds the weighted visitor-item matrix and fits the ALS model (skipped if artifacts already exist);
+4. loads the artifacts through `recommender.Recommender` as a smoke test;
+5. starts the API if `--serve` is passed.
+
+```bash
+python train.py                          # prepare everything, do not start the API
+python train.py --serve                  # prepare everything and start the API
+python train.py --force                  # retrain even if artifacts exist
+python train.py --min-interactions 2     # keep only visitors with at least 2 distinct items
+python train.py --use-all-data           # train on the whole event log instead of the outer training period
+```
+
+By default the script trains on events up to 2015-08-18 04:23:31 UTC (the outer training period), with the same event weights and ALS parameters as the notebook.
+
+`--min-interactions 2` makes the model smaller: most visitors in this dataset have a single event, so dropping them removes a large share of the visitor factors. Those visitors are then handled by the popularity fallback like any other unknown visitor. The offline metrics above were produced without this filter, so they do not describe a model trained with it.
+
 ## Recommendation service and API
 
 [`recommender.py`](recommender.py) defines `Recommender`, which loads the saved ALS model, sparse user-item matrix, and metadata once when instantiated.
@@ -117,42 +166,52 @@ Kaggle event data
     → chronological split and event weighting
     → sparse visitor-item matrix
     → ALS model and ID mappings
-    → saved artifacts
+    → saved artifacts (train.py)
     → Recommender class
     → FastAPI JSON response
 ```
 
 ## Setup and run
 
-Use the same Python environment for the notebook and API. The project has been exercised in a Python 3.12 environment.
+The project has been exercised in a Python 3.12 environment. Use the same environment for `train.py`, the notebooks, and the API.
 
 Install dependencies from the project root:
 
-```powershell
+```bash
 python -m pip install -r requirements.txt
 ```
 
-To rebuild the model artifacts, run the data preparation and final training/export cells in Notebook 02 in order. The exploratory ALS experiments take additional time. The API requires the following files under `artifacts/`:
+Build the artifacts and start the API with a single command:
 
-- `als_model.npz` — trained ALS factors (currently roughly 684 MB);
-- `user_item_matrix.npz` — sparse training matrix used for seen-item filtering;
-- `metadata.pkl` — visitor/item index mappings, popularity fallback list, and model configuration.
+```bash
+python train.py --serve
+```
 
-Start the local API from the project root:
+Or do it in two steps:
 
-```powershell
+```bash
+python train.py
 python -m uvicorn app:app --reload
 ```
 
-Then open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), try `POST /recommendations`, and inspect the response. Stop the development server with `Ctrl+C`.
+The API requires the following files under `artifacts/`. They are generated by `train.py` and are not committed to the repository:
+
+- `als_model.npz` — trained ALS factors. With all visitors included, the model exported during development was roughly 684 MB; `--min-interactions 2` reduces this;
+- `user_item_matrix.npz` — sparse training matrix used for seen-item filtering;
+- `metadata.pkl` — visitor/item index mappings, popularity fallback list, and model configuration.
+
+Alternatively, you can rebuild the artifacts by running the data preparation and final training/export cells in Notebook 02 in order. The exploratory ALS experiments take additional time.
+
+Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), try `POST /recommendations`, and inspect the response. Stop the development server with `Ctrl+C`.
 
 ## Dependencies
 
-See [`requirements.txt`](requirements.txt). `kagglehub` is only needed for the notebook's Kaggle download step; FastAPI and Uvicorn are needed to run the API; `ipykernel` is included for notebook use in editors such as VS Code.
+See [`requirements.txt`](requirements.txt). `kagglehub` is used by `train.py` and the notebooks to download the dataset; FastAPI and Uvicorn are needed to run the API; `ipykernel` is included for notebook use in editors such as VS Code.
 
 ## Current limitations
 
 - Recommendations are item IDs only; product names, images, prices, and readable category names are not included in the dataset.
 - The personalized ALS model cannot personalize for a visitor absent from training; those requests use popularity fallback.
 - The related-item recommender and personalized ALS service are separate systems. The current API serves the personalized ALS recommender only.
+- The model is trained from scratch on the first run and is not distributed with the repository. A model rebuilt by `train.py` may differ slightly from the one evaluated in the notebook; the recorded metrics refer to the notebook run.
 - The project is a local development MVP. It does not yet include authentication, deployment configuration, a product-catalog integration, automated API tests, or monitoring.
