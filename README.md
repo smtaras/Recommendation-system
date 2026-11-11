@@ -4,14 +4,14 @@
 
 A recommender system for an online store, built on the public [Retailrocket e-commerce dataset](https://www.kaggle.com/retailrocket/ecommerce-dataset) (views, add-to-cart events, and purchases). The project compares two approaches: a related-item heuristic based on products added to cart in the same session, and a personalized ALS model trained on implicit feedback. The ALS model is served through a FastAPI endpoint that falls back to popular items for visitors the model has not seen, and the whole pipeline runs with one command (`python train.py --serve`).
 
-Offline results on a chronological hold-out (top-10 recommendations, Recall@10):
+Offline results on a chronological hold-out: macro Recall@10 over **all** visitors who add to cart or buy in the test period, scored with the same code path the API uses.
 
-| Target | ALS | Popularity baseline |
-| --- | ---: | ---: |
-| Add to cart | **0.0214** | 0.0088 |
-| Transaction | 0.0134 | **0.0171** |
+| Future event | ALS + popularity fallback | Popularity only | Visitors with no training history |
+| --- | ---: | ---: | ---: |
+| Add to cart | **0.0110** | 0.0083 | 91% |
+| Transaction | 0.0118 | 0.0111 | 88% |
 
-ALS is about 2.4× better than the popularity baseline at predicting future add-to-cart events, but does not beat it for purchases. The scores cover only visitors seen in training (about 8% of visitors in the test period); everyone else receives the popularity fallback.
+**Key finding: cold start dominates.** About 9 in 10 of these visitors never appeared in training, so personalization can only help a small share of traffic. For visitors the model does know, ALS is well ahead of popularity (add to cart: 0.0376 vs 0.0088, 696 visitors), but across all visitors the gain is small: +0.0026 for add to cart (95% CI +0.0014 to +0.0039) and statistically indistinguishable from zero for transactions (+0.0007, 95% CI −0.0017 to +0.0034). Details are in [End-to-end evaluation](#end-to-end-evaluation-on-all-visitors).
 
 ![Interactive API documentation at /docs](docs/api-docs.png)
 
@@ -53,6 +53,7 @@ If Kaggle asks for credentials, see [Dataset](#dataset) below.
 ├── 01_related_item_recommendations.ipynb
 ├── 02_personalized_recommendations.ipynb
 ├── train.py                 # downloads data, trains ALS, writes artifacts, optionally starts the API
+├── evaluate_hybrid.py       # end-to-end evaluation (ALS + fallback) on all test-period visitors
 ├── recommender.py           # Recommender class used by the API
 ├── app.py                   # FastAPI application
 ├── requirements.txt
@@ -94,7 +95,7 @@ This is a heuristic recommender, not a trained ranking model. Co-occurrence is u
 [`02_personalized_recommendations.ipynb`](02_personalized_recommendations.ipynb) trains and evaluates an implicit-feedback ALS model:
 
 - Explores `view`, `addtocart`, and `transaction` event volumes and the event time range (2015-05-03 to 2015-09-18 UTC).
-- Uses a chronological 80/20 split. The outer training period ends at 2015-08-18 04:23:31 UTC; later events are held out as the outer test period.
+- Uses a chronological 80/20 split. The outer training period is the first 80% of events by time (up to 2015-08-18 04:23:31.966 UTC); later events are held out as the outer test period.
 - Gives event types strengths of `view=1`, `addtocart=3`, and `transaction=5`. For each visitor-item pair, the strongest event is kept (`max`), rather than summing repeated events.
 - Builds a sparse visitor-by-item matrix and fits implicit Alternating Least Squares (ALS). The selected serving configuration is `factors=128`, `regularization=0.5`, `alpha=40`, `iterations=10`, `random_state=42`.
 - Evaluates top-10 recommendations for warm visitors and future add-to-cart/transaction targets. Previously seen visitor-item pairs and items absent from the training catalogue are excluded from the target set.
@@ -102,16 +103,18 @@ This is a heuristic recommender, not a trained ranking model. Co-occurrence is u
 
 The main metric is macro Recall@10: for each evaluated visitor, it measures the fraction of that visitor's unique future target items found among the ten recommendations, then averages over visitors. It is not the probability that a recommendation will be clicked or purchased.
 
-### Recorded evaluation snapshot
+### Warm-visitor evaluation (notebook)
 
-The saved notebook currently reports the following outer-test results for the selected model:
+The notebook scores top-10 recommendations for visitors who were already present in training ("warm" visitors) and whose future add-to-cart/transaction items are known to the model:
 
-| Future event | ALS Recall@10 | Popularity Recall@10 |
-| --- | ---: | ---: |
-| Add to cart | 0.0214 | 0.0088 |
-| Transaction | 0.0134 | 0.0171 |
+| Future event | ALS Recall@10 | Popularity Recall@10 | Visitors |
+| --- | ---: | ---: | ---: |
+| Add to cart | 0.0376 | 0.0088 | 696 |
+| Transaction | 0.0234 | 0.0171 | 266 |
 
-ALS beats the popularity baseline for add-to-cart targets in this run, but not for transactions. On the outer test period, only about 8% of distinct visitors had appeared in training; the notebook's offline ALS metric is evaluated on warm visitors and known items. New visitors are handled by the API's popularity fallback, but the displayed offline metrics do not evaluate that fallback over every new visitor.
+ALS is ahead of the popularity baseline for both targets. With only 266 visitors the transaction estimate is noisy (95% bootstrap CI for ALS: 0.0078 to 0.0421, which includes the popularity score), so the transaction advantage is not established. Add-to-cart has a clearer margin (95% CI for ALS: 0.0256 to 0.0510).
+
+On the outer test period only about 8% of distinct visitors had appeared in training, so this metric describes a small part of the traffic. The next section evaluates the whole system, including the fallback for everyone else.
 
 Validation scores varied between time windows, particularly for transactions. The test period was also inspected during iterative development, so treat these numbers as a project evaluation snapshot rather than a pristine, untouched benchmark.
 
@@ -123,6 +126,42 @@ The two validation windows used for the `alpha` comparison were:
 | 2015-07-07 to 2015-07-26 | 0.0597 | 0.0386 | 0.0577 | 0.0386 |
 
 These windows have different training histories and target populations, so compare each configuration within a window rather than interpreting the two rows as directly equivalent test populations. `alpha=40` was retained as the balanced choice across the two windows.
+
+## End-to-end evaluation on all visitors
+
+The warm-visitor metric above ignores most traffic. [`evaluate_hybrid.py`](evaluate_hybrid.py) scores **every** visitor who has a future add-to-cart or transaction in the test period, calling the same `Recommender.recommend_items` the API serves: ALS for visitors seen in training, popularity fallback for everyone else. Targets follow the notebook's definition (items the visitor already interacted with and items absent from the training catalogue are excluded), so the warm rows reproduce the notebook numbers exactly in visitor counts and popularity baseline.
+
+Macro Recall@10, add to cart:
+
+| Visitors | Share | ALS + fallback | Popularity only |
+| --- | ---: | ---: | ---: |
+| All scored visitors (7,582) | 100% | **0.0110** | 0.0083 |
+| Warm: seen in training (696) | 9.2% | 0.0376 | 0.0088 |
+| Cold: unseen, fallback (6,886) | 90.8% | 0.0083 | 0.0083 |
+
+Macro Recall@10, transaction:
+
+| Visitors | Share | ALS + fallback | Popularity only |
+| --- | ---: | ---: | ---: |
+| All scored visitors (2,291) | 100% | **0.0118** | 0.0111 |
+| Warm: seen in training (266) | 11.6% | 0.0234 | 0.0171 |
+| Cold: unseen, fallback (2,025) | 88.4% | 0.0103 | 0.0103 |
+
+Paired difference between the system and popularity-only over all visitors (95% bootstrap CI): add to cart +0.0026 [+0.0014, +0.0039]; transaction +0.0007 [−0.0017, +0.0034], i.e. not distinguishable from zero.
+
+How to read this:
+
+- For cold visitors the system is, by construction, the popularity fallback, so the headline number is dominated by how good that fallback is. About 9 in 10 scored visitors fall into this group.
+- Personalization helps where it applies, but it applies to a small share of visitors, so the system-level gain is modest.
+- Scored visitors are those with a future add-to-cart or transaction and at least one eligible target; 6.3% (add to cart) and 5.2% (transaction) of target visitor-item pairs involve items absent from the training catalogue and are excluded, because no model trained on the training period could recommend them.
+- The test period was inspected during development, so the figures are a project snapshot rather than an untouched benchmark.
+
+```bash
+python evaluate_hybrid.py                 # full run
+python evaluate_hybrid.py --sample 3000   # quick trial on a random subset
+```
+
+The script requires artifacts trained on the training period only (the default of `train.py`) and refuses artifacts trained with `--use-all-data`.
 
 ## Training script (`train.py`)
 
@@ -142,9 +181,9 @@ python train.py --min-interactions 2     # keep only visitors with at least 2 di
 python train.py --use-all-data           # train on the whole event log instead of the outer training period
 ```
 
-By default the script trains on events up to 2015-08-18 04:23:31 UTC (the outer training period), with the same event weights and ALS parameters as the notebook.
+By default the script trains on the first 80% of events by time (up to 2015-08-18 04:23:31.966 UTC, the outer training period), with the same event weights, ALS parameters, index ordering, and popularity ranking as the notebook. A rebuilt model reproduces the notebook's matrix shape (1,123,767 × 212,916) and its evaluation figures.
 
-`--min-interactions 2` makes the model smaller: most visitors in this dataset have a single event, so dropping them removes a large share of the visitor factors. Those visitors are then handled by the popularity fallback like any other unknown visitor. The offline metrics above were produced without this filter, so they do not describe a model trained with it.
+`--min-interactions 2` makes the model smaller: most visitors in this dataset have a single event, so dropping them removes a large share of the visitor factors. Those visitors are then handled by the popularity fallback like any other unknown visitor. The metrics in this README were produced without this filter, so they do not describe a model trained with it.
 
 ## Recommendation service and API
 
@@ -213,7 +252,7 @@ python -m uvicorn app:app --reload
 
 The API requires the following files under `artifacts/`. They are generated by `train.py` and are not committed to the repository:
 
-- `als_model.npz` — trained ALS factors. With all visitors included, the model exported during development was roughly 684 MB; `--min-interactions 2` reduces this;
+- `als_model.npz` — trained ALS factors. With all visitors included the file is about 650 MB; `--min-interactions 2` reduces this;
 - `user_item_matrix.npz` — sparse training matrix used for seen-item filtering;
 - `metadata.pkl` — visitor/item index mappings, popularity fallback list, and model configuration.
 
@@ -230,5 +269,6 @@ See [`requirements.txt`](requirements.txt). `kagglehub` is used by `train.py` an
 - Recommendations are item IDs only; product names, images, prices, and readable category names are not included in the dataset.
 - The personalized ALS model cannot personalize for a visitor absent from training; those requests use popularity fallback.
 - The related-item recommender and personalized ALS service are separate systems. The current API serves the personalized ALS recommender only.
-- The model is trained from scratch on the first run and is not distributed with the repository. A model rebuilt by `train.py` may differ slightly from the one evaluated in the notebook; the recorded metrics refer to the notebook run.
+- Cold start dominates: about 90% of visitors with a future add-to-cart or purchase had no training history, so most traffic is served by the popularity fallback. Improving that fallback matters more than tuning ALS.
+- The model is trained from scratch on the first run and is not distributed with the repository. ALS training is not guaranteed to be bit-for-bit identical across machines and thread counts, so a rebuilt model may differ slightly in the last digits.
 - The project is a local development MVP. It does not yet include authentication, deployment configuration, a product-catalog integration, automated API tests, or monitoring.

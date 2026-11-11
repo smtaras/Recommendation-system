@@ -9,10 +9,16 @@ It will:
   2. train the ALS model and write artifacts/ (if they are not there yet);
   3. smoke-test the artifacts through recommender.Recommender;
   4. start the API at http://127.0.0.1:8000/docs (only with --serve).
+
+Other options:
+    python train.py                       # prepare everything, do not start the API
+    python train.py --force               # retrain even if artifacts exist
+    python train.py --min-interactions 2  # drop visitors with a single item
+    python train.py --use-all-data        # train on the whole event log (no hold-out!)
 """
 import os
 
-# implicit warns (and runs slower) if BLAS uses its own threads. Set before imports
+# implicit warns (and runs slower) if BLAS uses its own threads. Set before imports.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -32,11 +38,12 @@ ARTIFACT_FILES = ("als_model.npz", "user_item_matrix.npz", "metadata.pkl")
 
 EVENT_WEIGHTS = {"view": 1, "addtocart": 3, "transaction": 5}
 
-# Same as the selected serving configuration in notebook 02.
-ALS_PARAMS = dict(factors=128, regularization=0.5, iterations=10, random_state=42)
-ALPHA = 40
+# Same as the selected serving configuration in notebook 02 (alpha is passed to the
+# constructor and fit() receives the raw 1/3/5 matrix, exactly as in the notebook).
+ALS_PARAMS = dict(factors=128, regularization=0.5, alpha=40, iterations=10, random_state=42)
 
-DEFAULT_TRAIN_END = "2015-08-18 04:23:31"
+# Outer training period = first 80% of events by time (notebook: timestamp.quantile(0.8)).
+TRAIN_QUANTILE = 0.8
 
 POPULAR_ITEMS_TO_KEEP = 1000
 
@@ -104,7 +111,8 @@ def ensure_events_csv(data_dir: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # Step 2: training
 # --------------------------------------------------------------------------- #
-def build_interactions(events_path: Path, train_end, min_interactions: int):
+def build_interactions(events_path: Path, train_end, use_all_data: bool, min_interactions: int):
+    """Return (pairs, cutoff_ms). cutoff_ms is None when all events are used."""
     import pandas as pd
 
     events = pd.read_csv(
@@ -113,10 +121,15 @@ def build_interactions(events_path: Path, train_end, min_interactions: int):
         dtype={"visitorid": "int64", "itemid": "int64"},
     )
 
-    if train_end is not None:
-        cutoff_ms = int(pd.Timestamp(train_end, tz="UTC").timestamp() * 1000)
+    cutoff_ms = None
+    if not use_all_data:
+        if train_end:
+            cutoff_ms = int(pd.Timestamp(train_end, tz="UTC").timestamp() * 1000)
+        else:
+            cutoff_ms = int(events["timestamp"].quantile(TRAIN_QUANTILE))
         events = events[events["timestamp"] <= cutoff_ms]
-        print(f"[train] Using events up to {train_end} UTC: {len(events):,} rows")
+        shown = pd.to_datetime(cutoff_ms, unit="ms", utc=True)
+        print(f"[train] Using events up to {shown} ({len(events):,} rows)")
     else:
         print(f"[train] Using ALL events: {len(events):,} rows")
 
@@ -133,29 +146,28 @@ def build_interactions(events_path: Path, train_end, min_interactions: int):
         print(f"[train] Visitors with >= {min_interactions} items: "
               f"{after:,} of {before:,} ({after / before:.1%})")
 
-    return pairs
+    return pairs, cutoff_ms
 
 
-def train(events_path: Path, out_dir: Path, train_end, min_interactions: int) -> int:
+def train(events_path: Path, out_dir: Path, train_end, use_all_data: bool,
+          min_interactions: int) -> int:
     import numpy as np  # noqa: F401
+    import pandas as pd
     from scipy.sparse import csr_matrix, save_npz
     from implicit.cpu.als import AlternatingLeastSquares
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pairs = build_interactions(events_path, train_end, min_interactions)
+    pairs, cutoff_ms = build_interactions(events_path, train_end, use_all_data, min_interactions)
 
-    # Categories are built AFTER filtering, so matrix and mappings contain
-    # only visitors/items that are actually present
-    visitor_cat = pairs["visitorid"].astype("category")
-    item_cat = pairs["itemid"].astype("category")
-    visitor_ids = visitor_cat.cat.categories.to_numpy()
-    item_ids = item_cat.cat.categories.to_numpy()
+    # pd.factorize (order of appearance), exactly like the notebook: the ALS random
+    # initialisation depends on row/column order, so this keeps results reproducible.
+    # Factorizing happens AFTER filtering, so matrix and mappings only contain
+    # visitors/items that are actually present.
+    user_codes, visitor_ids = pd.factorize(pairs["visitorid"])
+    item_codes, item_ids = pd.factorize(pairs["itemid"])
 
     matrix = csr_matrix(
-        (
-            pairs["weight"].to_numpy(dtype="float32"),
-            (visitor_cat.cat.codes.to_numpy(), item_cat.cat.codes.to_numpy()),
-        ),
+        (pairs["weight"].to_numpy(dtype="float32"), (user_codes, item_codes)),
         shape=(len(visitor_ids), len(item_ids)),
     )
     print(f"[train] Matrix: {matrix.shape[0]:,} visitors x {matrix.shape[1]:,} items, "
@@ -163,10 +175,10 @@ def train(events_path: Path, out_dir: Path, train_end, min_interactions: int) ->
 
     print("[train] Training ALS (a few minutes on a typical laptop)...")
     model = AlternatingLeastSquares(**ALS_PARAMS)
-    model.fit(matrix * ALPHA)
+    model.fit(matrix)
 
-    # Popularity fallback: items ranked by number of distinct visitors
-    popularity = pairs.groupby("itemid")["visitorid"].nunique()
+    # Popularity fallback: items ranked by summed interaction strength (as in the notebook).
+    popularity = pairs.groupby("itemid")["weight"].sum()
     popular_item_ids = (
         popularity.sort_values(ascending=False)
         .head(POPULAR_ITEMS_TO_KEEP)
@@ -176,13 +188,12 @@ def train(events_path: Path, out_dir: Path, train_end, min_interactions: int) ->
 
     metadata = {
         "user_to_index": {int(v): i for i, v in enumerate(visitor_ids)},
-        "item_ids": item_ids,  # position in this array == column in the matrix
+        "item_ids": np.asarray(item_ids),  # position in this array == column in the matrix
         "popular_item_ids": popular_item_ids,
         "config": {
             **ALS_PARAMS,
-            "alpha": ALPHA,
             "event_weights": EVENT_WEIGHTS,
-            "train_end": train_end,
+            "train_end_ms": cutoff_ms,  # None => trained on ALL events
             "min_interactions": min_interactions,
         },
     }
@@ -234,8 +245,9 @@ def main() -> None:
     )
     parser.add_argument("--data-dir", default=str(ROOT / "data"))
     parser.add_argument("--out-dir", default=str(ROOT / "artifacts"))
-    parser.add_argument("--train-end", default=DEFAULT_TRAIN_END,
-                        help="UTC cutoff for training events (default: outer train end)")
+    parser.add_argument("--train-end", default=None,
+                        help="UTC cutoff for training events, e.g. '2015-08-18 04:23:31' "
+                             "(default: first 80%% of events by time, as in the notebook)")
     parser.add_argument("--use-all-data", action="store_true",
                         help="ignore --train-end and train on every event")
     parser.add_argument("--min-interactions", type=int, default=1,
@@ -260,8 +272,8 @@ def main() -> None:
               f"(use --force to retrain).")
     else:
         events_path = ensure_events_csv(data_dir)
-        train_end = None if args.use_all_data else args.train_end
-        first_visitor = train(events_path, out_dir, train_end, args.min_interactions)
+        first_visitor = train(events_path, out_dir, args.train_end, args.use_all_data,
+                              args.min_interactions)
 
     smoke_test(out_dir, first_visitor)
 
