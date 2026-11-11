@@ -1,5 +1,22 @@
 # Retailrocket Recommendation System
 
+## TL;DR
+
+A recommender system for an online store, built on the public [Retailrocket e-commerce dataset](https://www.kaggle.com/retailrocket/ecommerce-dataset) (views, add-to-cart events, and purchases). The project compares two approaches: a related-item heuristic based on products added to cart in the same session, and a personalized ALS model trained on implicit feedback. The ALS model is served through a FastAPI endpoint that falls back to popular items for visitors the model has not seen, and the whole pipeline runs with one command (`python train.py --serve`).
+
+Offline results on a chronological hold-out (top-10 recommendations, Recall@10):
+
+| Target | ALS | Popularity baseline |
+| --- | ---: | ---: |
+| Add to cart | **0.0214** | 0.0088 |
+| Transaction | 0.0134 | **0.0171** |
+
+ALS is about 2.4× better than the popularity baseline at predicting future add-to-cart events, but does not beat it for purchases. The scores cover only visitors seen in training (about 8% of visitors in the test period); everyone else receives the popularity fallback.
+
+![Interactive API documentation at /docs](docs/api-docs.png)
+
+## About
+
 Pet project for exploring two recommendation approaches on the Retailrocket e-commerce dataset:
 
 - a related-item recommender based on products added to cart in the same session;
@@ -96,7 +113,7 @@ The saved notebook currently reports the following outer-test results for the se
 
 ALS beats the popularity baseline for add-to-cart targets in this run, but not for transactions. On the outer test period, only about 8% of distinct visitors had appeared in training; the notebook's offline ALS metric is evaluated on warm visitors and known items. New visitors are handled by the API's popularity fallback, but the displayed offline metrics do not evaluate that fallback over every new visitor.
 
-Validation scores varied between time windows, particularly for transactions. The test period was also inspected during iterative development, so treat these numbers as a project evaluation snapshot rather than a pristine, untouched benchmark. Do not tune model parameters against the outer test results.
+Validation scores varied between time windows, particularly for transactions. The test period was also inspected during iterative development, so treat these numbers as a project evaluation snapshot rather than a pristine, untouched benchmark.
 
 The two validation windows used for the `alpha` comparison were:
 
